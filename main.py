@@ -5,12 +5,13 @@ from the oncall.collection_datas_archive table with statistics & graphs.
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-from datetime import datetime
+from datetime import datetime, timedelta
 import csv
 import threading
 import statistics
 from collections import defaultdict
-
+import calendar
+import time
 import mysql.connector
 from tkcalendar import DateEntry
 import matplotlib
@@ -18,6 +19,7 @@ matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 import matplotlib.dates as mdates
+import matplotlib.ticker
 
 
 # ── Database configuration ────────────────────────────────────────────
@@ -30,6 +32,15 @@ DB_CONFIG = {
 }
 
 COLUMNS = ("id", "device_id", "device_time", "server_time", "sat", "hgb", "probe")
+
+ALLOWED_DEVICES = [
+    "T2-0083",
+    "T2-0084",
+    "T2-0086",
+    "T2-0087",
+    "T2-0186",
+    "T2-0187",
+]
 
 
 class DeviceDataViewer(tk.Tk):
@@ -105,7 +116,7 @@ class DeviceDataViewer(tk.Tk):
         status_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
         self.status_var = tk.StringVar(value="Ready — select filters and click Fetch Data")
         ttk.Label(status_frame, textvariable=self.status_var).pack(side=tk.LEFT)
-        self.progress = ttk.Progressbar(status_frame, mode="indeterminate", length=150)
+        self.progress = ttk.Progressbar(status_frame, mode="determinate", length=250)
         self.progress.pack(side=tk.RIGHT)
 
         # ── Main content: tabbed notebook ─────────────────────────────
@@ -153,29 +164,11 @@ class DeviceDataViewer(tk.Tk):
         self.dev_stats_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         dev_vsb.pack(side=tk.LEFT, fill=tk.Y)
 
-    # ── Load distinct device IDs ──────────────────────────────────────
+    # ── Load device list ────────────────────────────────────────────────
     def _load_device_list(self):
-        def _worker():
-            try:
-                conn = mysql.connector.connect(**DB_CONFIG, connection_timeout=10, read_timeout=30)
-                cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT DISTINCT device_id FROM collection_datas_archive ORDER BY device_id"
-                )
-                devices = [row[0] for row in cursor.fetchall()]
-                cursor.close()
-                conn.close()
-                self.after(0, lambda: self._populate_devices(devices))
-            except mysql.connector.Error as exc:
-                msg = str(exc)
-                self.after(0, lambda: self.status_var.set(f"Could not load device list: {msg}"))
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _populate_devices(self, devices: list[str]):
-        self._device_list = devices
-        self.device_combo["values"] = ["All Devices"] + devices
-        self.status_var.set(f"Loaded {len(devices)} devices — ready to query")
+        self._device_list = ALLOWED_DEVICES
+        self.device_combo["values"] = ["All Devices"] + ALLOWED_DEVICES
+        self.status_var.set(f"Ready — {len(ALLOWED_DEVICES)} devices available")
 
     # ── Fetch data ────────────────────────────────────────────────────
     def _on_fetch(self):
@@ -207,7 +200,7 @@ class DeviceDataViewer(tk.Tk):
 
         self.fetch_btn.config(state=tk.DISABLED)
         self.export_btn.config(state=tk.DISABLED)
-        self.progress.start(10)
+        self.progress["value"] = 0
         self.status_var.set("Querying database…")
 
         threading.Thread(
@@ -216,37 +209,86 @@ class DeviceDataViewer(tk.Tk):
             daemon=True,
         ).start()
 
+    @staticmethod
+    def _week_chunks(start_dt: datetime, end_dt: datetime):
+        """Yield (chunk_start, chunk_end) pairs, one per 7-day window."""
+        cur = start_dt
+        while cur <= end_dt:
+            chunk_end = min(cur + timedelta(days=6, hours=23, minutes=59, seconds=59) - timedelta(
+                hours=cur.hour, minutes=cur.minute, seconds=cur.second),
+                end_dt)
+            # simpler: advance 6 days then cap at end-of-day
+            day_end = (cur + timedelta(days=6)).replace(hour=23, minute=59, second=59)
+            chunk_end = min(day_end, end_dt)
+            yield cur, chunk_end
+            cur = chunk_end + timedelta(seconds=1)
+
     def _fetch_worker(self, start_dt: datetime, end_dt: datetime, device_id: str | None):
-        try:
-            conn = mysql.connector.connect(**DB_CONFIG, connection_timeout=15, read_timeout=120)
-            cursor = conn.cursor()
+
+        chunks = list(self._week_chunks(start_dt, end_dt))
+        # Query one device at a time — smaller result sets, uses index better
+        devices = [device_id] if device_id else ALLOWED_DEVICES
+        tasks = [(c_start, c_end, dev) for (c_start, c_end) in chunks for dev in devices]
+        total_tasks = len(tasks)
+        all_rows: list[tuple] = []
+
+        for idx, (c_start, c_end, dev) in enumerate(tasks, 1):
+            label = f"{dev} {c_start.strftime('%b %d')}–{c_end.strftime('%b %d')}"
+            self.after(0, lambda i=idx, t=total_tasks, lb=label, n=len(all_rows):
+                       self.status_var.set(
+                           f"Fetching {lb}  ({i}/{t}) — {n:,} rows so far"))
 
             query = (
                 "SELECT id, device_id, device_time, server_time, sat, hgb, probe "
                 "FROM collection_datas_archive "
-                "WHERE device_time BETWEEN %s AND %s"
+                "WHERE device_id = %s AND device_time BETWEEN %s AND %s "
+                "ORDER BY device_time"
             )
-            params: list = [start_dt, end_dt]
+            params = [dev, c_start, c_end]
 
-            if device_id is not None:
-                query += " AND device_id = %s"
-                params.append(device_id)
+            success = False
+            for attempt in range(3):
+                try:
+                    conn = mysql.connector.connect(
+                        **DB_CONFIG, connection_timeout=30, read_timeout=600,
+                    )
+                    cursor = conn.cursor()
+                    cursor.execute(query, params)
+                    rows = cursor.fetchall()
+                    cursor.close()
+                    conn.close()
+                    all_rows.extend(rows)
+                    success = True
+                    break
+                except mysql.connector.Error:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    if attempt < 2:
+                        self.after(0, lambda lb=label, a=attempt:
+                                   self.status_var.set(
+                                       f"Retrying {lb} ({a + 1}/2)…"))
+                        time.sleep(3 * (attempt + 1))
 
-            query += " ORDER BY device_time"
+            if not success:
+                self.after(0, lambda lb=label:
+                           self._query_error(f"Failed after 3 attempts on {lb}"))
+                return
 
-            cursor.execute(query, params)
-            rows = cursor.fetchall()
-            cursor.close()
-            conn.close()
+            pct = int(idx / total_tasks * 100)
+            self.after(0, lambda p=pct: self.progress.configure(value=p))
 
-            self.after(0, lambda: self._display_results(rows))
-        except mysql.connector.Error as exc:
-            msg = str(exc)
-            self.after(0, lambda: self._query_error(msg))
+            if idx < total_tasks:
+                time.sleep(0.5)
+
+        # Sort by device_time across all devices
+        all_rows.sort(key=lambda r: r[2])
+        self.after(0, lambda: self._display_results(all_rows))
 
     # ── Display results ───────────────────────────────────────────────
     def _display_results(self, rows: list[tuple]):
-        self.progress.stop()
+        self.progress["value"] = 100
         self.fetch_btn.config(state=tk.NORMAL)
 
         self._rows = rows
@@ -275,7 +317,7 @@ class DeviceDataViewer(tk.Tk):
         self._update_histograms(sats, hgbs, probes)
 
     def _query_error(self, msg: str):
-        self.progress.stop()
+        self.progress["value"] = 0
         self.fetch_btn.config(state=tk.NORMAL)
         self.status_var.set("Query failed")
         messagebox.showerror("Database Error", msg)
@@ -321,23 +363,69 @@ class DeviceDataViewer(tk.Tk):
         for w in self.charts_frame.winfo_children():
             w.destroy()
 
-        fig = Figure(figsize=(11, 5), dpi=96)
-        fig.subplots_adjust(hspace=0.45, left=0.07, right=0.97, top=0.94, bottom=0.12)
+        # Normalize SAT: divide by 100 to get 0–1 range (like OncallDataForm)
+        sats_norm = [s / 100.0 for s in sats]
 
-        for i, (data, color, label) in enumerate([
-            (sats, "#1f77b4", "SAT"),
-            (hgbs, "#ff7f0e", "HGB"),
-        ], 1):
-            ax = fig.add_subplot(2, 1, i)
-            ax.plot(times, data, linewidth=0.7, color=color)
-            ax.set_ylabel(label)
-            ax.set_title(f"{label} over Time")
-            ax.grid(True, alpha=0.3)
-            ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
-            for lbl in ax.get_xticklabels():
-                lbl.set_rotation(30)
-                lbl.set_fontsize(8)
-        fig.axes[-1].set_xlabel("Device Time")
+        # Thin out if too many points (pick every Nth point, no averaging)
+        n = len(times)
+        max_pts = 5000
+        if n > max_pts:
+            step = n // max_pts
+            indices = range(0, n, step)
+            times_p = [times[i] for i in indices]
+            sats_p = [sats_norm[i] for i in indices]
+            hgbs_p = [hgbs[i] for i in indices]
+        else:
+            times_p, sats_p, hgbs_p = times, sats_norm, hgbs
+
+        # Use sequential index for X-axis (like C# IsXValueIndexed = true)
+        # This eliminates gaps and makes lines clean
+        x_indices = list(range(len(times_p)))
+
+        # Build tick labels at regular intervals
+        num_ticks = min(40, len(times_p))
+        tick_step = max(1, len(times_p) // num_ticks)
+        tick_positions = list(range(0, len(times_p), tick_step))
+        tick_labels = [times_p[i].strftime("%m/%d %H:%M") for i in tick_positions]
+
+        fig = Figure(figsize=(11, 5), dpi=96)
+        fig.subplots_adjust(left=0.08, right=0.92, top=0.92, bottom=0.22)
+
+        ax1 = fig.add_subplot(1, 1, 1)
+
+        # SAT on primary Y-axis (blue)
+        ax1.plot(x_indices, sats_p, linewidth=1, color="blue", label="Sat")
+        ax1.set_ylabel("Saturation", fontsize=11)
+        ax1.set_ylim(0, 1)
+        ax1.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(xmax=1.0))
+        ax1.set_yticks([0, 0.25, 0.50, 0.75, 1.00])
+        ax1.grid(True, alpha=0.3)
+
+        # HGB (tGb) on secondary Y-axis (orange/yellow)
+        ax2 = ax1.twinx()
+        ax2.plot(x_indices, hgbs_p, linewidth=1, color="#FFC800", label="tGb")
+        ax2.set_ylabel("Total Relative Hemoglobin", fontsize=11)
+        ax2.set_ylim(0, 0.5)
+        ax2.set_yticks([0, 0.1, 0.2, 0.3, 0.4, 0.5])
+        ax2.yaxis.grid(False)
+
+        # X-axis labels
+        ax1.set_xticks(tick_positions)
+        ax1.set_xticklabels(tick_labels, rotation=90, fontsize=7)
+        ax1.set_xlabel("Device Date and Time", fontsize=11)
+        ax1.set_xlim(0, len(times_p) - 1)
+
+        # Title
+        device = self.device_var.get()
+        if device != "All Devices":
+            fig.suptitle(f"Data for {device}", fontsize=14, fontweight="bold")
+        else:
+            fig.suptitle("Time Series — All Devices", fontsize=14, fontweight="bold")
+
+        # Combined legend
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=9)
 
         canvas = FigureCanvasTkAgg(fig, master=self.charts_frame)
         canvas.draw()
